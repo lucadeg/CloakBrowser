@@ -1,9 +1,7 @@
+
 name: Publish
 
 on:
-  push:
-    tags:
-      - 'v*'
   workflow_dispatch:
     inputs:
       job:
@@ -16,6 +14,7 @@ on:
           - publish-npm
           - publish-docker
 
+  # Automatic triggers removed; invoke through FounderOS/Admin Gate.
 concurrency:
   group: publish
   cancel-in-progress: false
