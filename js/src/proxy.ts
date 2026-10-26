@@ -2,6 +2,8 @@
  * Shared proxy URL parsing for Playwright and Puppeteer wrappers.
  */
 
+import { binarySupportsHttpProxyInlineAuth } from "./config.js";
+
 export interface ParsedProxy {
   server: string;
   username?: string;
@@ -19,9 +21,9 @@ export function ensureProxyScheme(proxyUrl: string): string {
 /**
  * Parse a proxy URL, extracting credentials into separate fields.
  *
- * Handles: "http://user:pass@host:port" -> { server: "http://host:port", username: "user", password: "pass" }
- * Also handles: no credentials, URL-encoded special chars, socks5://, missing port,
- * and bare proxy strings without a scheme (e.g. "user:pass@host:port" -> treated as http).
+ * Handles authenticated proxy URLs by extracting credentials into separate
+ * fields. Also handles: no credentials, URL-encoded special chars, socks5://,
+ * missing port, and bare proxy strings without a scheme.
  */
 /** Proxy dict shape accepted by Playwright/Puppeteer wrappers. */
 export type ProxyDict = { server: string; bypass?: string; username?: string; password?: string };
@@ -72,7 +74,7 @@ function assembleSocksUrl(
  * bare ``%`` not followed by two hex digits is left as a literal ``%``.
  */
 function lenientDecodeURIComponent(s: string): string {
-  return s.replace(/%([0-9A-Fa-f]{2})|%/g, (match, hex) =>
+  return s.replace(/%([0-9A-Fa-f]{2})|%/g, (_match, hex) =>
     hex ? String.fromCharCode(parseInt(hex, 16)) : "%",
   );
 }
@@ -155,13 +157,94 @@ export function normalizeSocksStringUrl(urlStr: string): string {
   }
 }
 
+function hasCredentials(proxy: string | ProxyDict): boolean {
+  if (typeof proxy === "string") return proxy.includes("@");
+  return !!proxy.username;
+}
+
+/**
+ * Reconstruct an HTTP(S) proxy URL with inline credentials from a proxy dict.
+ */
+export function reconstructHttpUrl(proxy: ProxyDict): string {
+  if (!proxy.username) return proxy.server;
+  const url = new URL(ensureProxyScheme(proxy.server));
+  url.username = encodeURIComponent(proxy.username);
+  if (proxy.password) url.password = encodeURIComponent(proxy.password);
+  return url.href.replace(/\/$/, "");
+}
+
+/**
+ * Re-encode credentials in an HTTP(S) proxy URL string for --proxy-server.
+ * Same pattern as normalizeSocksStringUrl.
+ */
+export function normalizeHttpStringUrl(urlStr: string): string {
+  const normalized = urlStr.includes("://") ? urlStr : `http://${urlStr}`;
+  const schemeMatch = normalized.match(/^([a-z][a-z0-9+\-.]*):\/\/(.*)$/i);
+  if (!schemeMatch) return normalized;
+  const [, scheme, rest] = schemeMatch;
+  const hostStart = rest.search(/[/?#]/);
+  const authority = hostStart === -1 ? rest : rest.slice(0, hostStart);
+  const suffix = hostStart === -1 ? "" : rest.slice(hostStart);
+  const atIdx = authority.lastIndexOf("@");
+  if (atIdx === -1) return normalized;
+  const userinfo = authority.slice(0, atIdx);
+  const hostPart = authority.slice(atIdx + 1);
+  const bracketEnd = hostPart.lastIndexOf("]");
+  const portColonIdx = hostPart.indexOf(":", Math.max(bracketEnd, 0));
+  if (portColonIdx !== -1) {
+    const portStr = hostPart.slice(portColonIdx + 1);
+    if (portStr && !/^\d+$/.test(portStr)) {
+      console.warn(`[cloakbrowser] Malformed HTTP proxy URL, passing through unchanged: invalid port`);
+      return normalized;
+    }
+  }
+  const hostAndRest = hostPart + suffix;
+  const colonIdx = userinfo.indexOf(":");
+  const rawUserEnc = colonIdx === -1 ? userinfo : userinfo.slice(0, colonIdx);
+  const hasPassword = colonIdx !== -1;
+  const rawPassEnc = hasPassword ? userinfo.slice(colonIdx + 1) : "";
+  try {
+    const encUser = rawUserEnc ? encodeURIComponent(lenientDecodeURIComponent(rawUserEnc)) : "";
+    const encPass = hasPassword
+      ? (rawPassEnc ? encodeURIComponent(lenientDecodeURIComponent(rawPassEnc)) : "")
+      : null;
+    let userinfoPart: string;
+    if (encPass !== null) {
+      userinfoPart = `${encUser}:${encPass}@`;
+    } else if (encUser) {
+      userinfoPart = `${encUser}@`;
+    } else {
+      userinfoPart = "";
+    }
+    const result = `${scheme}://${userinfoPart}${hostAndRest}`;
+    const credsChanged = encUser !== rawUserEnc
+      || (hasPassword ? encPass !== rawPassEnc : false);
+    if (credsChanged) {
+      console.info(
+        "[cloakbrowser] Auto URL-encoded HTTP proxy credentials (special " +
+        "characters detected). Pre-encode the URL to suppress this notice.",
+      );
+    }
+    return result;
+  } catch (e) {
+    console.warn(`[cloakbrowser] Could not normalize HTTP proxy URL, passing through unchanged: ${(e as Error).message}`);
+    return normalized;
+  }
+}
+
 /**
  * Resolve proxy into Playwright option and/or Chrome args.
  *
- * Playwright rejects SOCKS5 proxies with credentials in its proxy dict,
- * so SOCKS5 is passed via --proxy-server Chrome arg instead.
+ * Proxies with credentials (SOCKS5 or HTTP/HTTPS on supported platforms) are
+ * passed via Chrome's --proxy-server flag with inline credentials, bypassing
+ * Playwright's CDP auth interceptor which breaks on some proxies (#182).
  */
-export function resolveProxyConfig(proxy: string | ProxyDict | undefined): ProxyConfig {
+export function resolveProxyConfig(
+  proxy: string | ProxyDict | undefined,
+  browserVersion?: string,
+  licenseKey?: string,
+  releaseChannel?: string,
+): ProxyConfig {
   if (!proxy) return { proxyArgs: [] };
 
   if (isSocksProxy(proxy)) {
@@ -177,7 +260,24 @@ export function resolveProxyConfig(proxy: string | ProxyDict | undefined): Proxy
     return { proxyArgs: args };
   }
 
-  // HTTP/HTTPS: use Playwright's proxy dict
+  // HTTP/HTTPS with credentials, only on binaries that ship inline proxy auth:
+  // use Chrome's native proxy authentication path instead of Playwright's CDP
+  // auth interceptor (#182). Older binaries (free macOS/linux-arm64) can't parse
+  // inline credentials, so they fall through to the Playwright proxy dict below.
+  if (
+    hasCredentials(proxy) &&
+    binarySupportsHttpProxyInlineAuth(licenseKey, browserVersion, releaseChannel)
+  ) {
+    if (typeof proxy === "string") {
+      return { proxyArgs: [`--proxy-server=${normalizeHttpStringUrl(proxy)}`] };
+    }
+    const httpUrl = reconstructHttpUrl(proxy);
+    const args = [`--proxy-server=${httpUrl}`];
+    if (proxy.bypass) args.push(`--proxy-bypass-list=${proxy.bypass}`);
+    return { proxyArgs: args };
+  }
+
+  // HTTP/HTTPS without credentials (or unsupported platform): use Playwright's proxy dict
   if (typeof proxy === "string") {
     return { proxyOption: parseProxyUrl(proxy), proxyArgs: [] };
   }
@@ -212,4 +312,40 @@ export function parseProxyUrl(proxy: string): ParsedProxy {
   }
 
   return result;
+}
+
+let requestProxyWarned = false;
+
+/** @internal Exported for testing only. */
+export function resetRequestProxyWarned(): void {
+  requestProxyWarned = false;
+}
+
+/**
+ * Warn once, on first use, that Playwright's request client does not use a proxy
+ * we passed as --proxy-server (#579). Playwright only proxies context.request when
+ * it owns the proxy. get/post/fetch, page.request and route.fetch() all funnel
+ * through context.request._innerFetch, so one instance wrap catches every path.
+ */
+export function warnOnRequestClientUse(context: unknown): void {
+  const ctx = context as any;
+  // A per-context proxy does reach the request client, so nothing leaks there.
+  if (ctx?._options?.proxy) return;
+  const req = ctx?.request;
+  // Private Playwright API: if it is ever renamed, skip rather than break.
+  if (typeof req?._innerFetch !== "function") return;
+  req._innerFetch = function (...args: unknown[]) {
+    // Self-remove so only the first call runs through us (keeps Playwright's
+    // API-call naming in traces intact for every later call).
+    delete req._innerFetch;
+    if (!requestProxyWarned) {
+      requestProxyWarned = true;
+      console.warn(
+        "[cloakbrowser] context.request / page.request / route.fetch() do not use this proxy " +
+          "(it is set on the browser, not Playwright) and will send from your real IP. " +
+          "Use page.evaluate(() => fetch(...)) for proxied requests.",
+      );
+    }
+    return req._innerFetch(...args);
+  };
 }
